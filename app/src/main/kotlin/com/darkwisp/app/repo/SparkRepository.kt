@@ -325,7 +325,33 @@ class SparkRepository(
 
     // --- Send ---
 
-    override suspend fun payInvoice(bolt11: String): Result<String> = withContext(Dispatchers.IO) {
+    /**
+     * Map an SDK payment to a settlement outcome.
+     *
+     * `sendPayment` waits up to `completionTimeoutSecs` and then returns
+     * whatever status it has: a payment that cannot settle — a second attempt
+     * on an already-settled invoice, for instance — comes back PENDING, and
+     * FAILED comes back without throwing. Reading only `payment.id` and
+     * calling every non-throwing response a success told the user sats had
+     * left their wallet when they had not.
+     */
+    private fun settlementOf(payment: breez_sdk_spark.Payment): Result<WalletPayment> =
+        when (payment.status) {
+            breez_sdk_spark.PaymentStatus.COMPLETED -> {
+                emitStatus("Payment completed")
+                Result.success(WalletPayment(payment.id, PaymentSettlement.COMPLETED))
+            }
+            breez_sdk_spark.PaymentStatus.PENDING -> {
+                emitStatus("Payment pending")
+                Result.success(WalletPayment(payment.id, PaymentSettlement.PENDING))
+            }
+            else -> {
+                emitStatus("Payment failed (${payment.status})")
+                Result.failure(Exception("Payment failed"))
+            }
+        }
+
+    override suspend fun payInvoice(bolt11: String): Result<WalletPayment> = withContext(Dispatchers.IO) {
         try {
             val instance = sdk ?: return@withContext Result.failure(Exception("Not connected"))
             emitStatus("Preparing payment...")
@@ -342,9 +368,7 @@ class SparkRepository(
                 SendPaymentRequest(prepareResponse, options)
             )
 
-            val paymentId = sendResponse.payment.id
-            emitStatus("Payment sent")
-            Result.success(paymentId)
+            settlementOf(sendResponse.payment)
         } catch (e: Exception) {
             emitStatus("Payment failed: ${e.message}")
             Result.failure(e)
@@ -377,7 +401,7 @@ class SparkRepository(
     }
 
     /** Send using a previously prepared response (avoids double-prepare). */
-    suspend fun sendPreparedPayment(prepareData: Any): Result<String> = withContext(Dispatchers.IO) {
+    suspend fun sendPreparedPayment(prepareData: Any): Result<WalletPayment> = withContext(Dispatchers.IO) {
         try {
             val instance = sdk ?: return@withContext Result.failure(Exception("Not connected"))
             val prepareResponse = prepareData as breez_sdk_spark.PrepareSendPaymentResponse
@@ -391,9 +415,7 @@ class SparkRepository(
                 SendPaymentRequest(prepareResponse, options)
             )
 
-            val paymentId = sendResponse.payment.id
-            emitStatus("Payment sent")
-            Result.success(paymentId)
+            settlementOf(sendResponse.payment)
         } catch (e: Exception) {
             emitStatus("Payment failed: ${e.message}")
             Result.failure(e)
@@ -472,7 +494,11 @@ class SparkRepository(
                         amountMsats = payment.amount.toLong() * 1000,
                         feeMsats = payment.fees.toLong() * 1000,
                         createdAt = payment.timestamp.toLong(),
-                        settledAt = payment.timestamp.toLong()
+                        // Only a settled payment has a settle time. Stamping one
+                        // unconditionally made pending and failed payments look
+                        // like they had landed.
+                        settledAt = if (payment.status == breez_sdk_spark.PaymentStatus.COMPLETED)
+                            payment.timestamp.toLong() else null
                     )
                 }
                 Result.success(transactions)
