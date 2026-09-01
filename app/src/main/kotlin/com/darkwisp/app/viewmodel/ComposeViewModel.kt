@@ -47,8 +47,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 
@@ -108,6 +111,11 @@ class ComposeViewModel(app: Application, private val savedStateHandle: SavedStat
 
     private val _mentions = MutableStateFlow<List<Mention>>(restoreMentionsFromState(savedStateHandle))
     val mentions: StateFlow<List<Mention>> = _mentions
+
+    /** Draft text with mentions materialized to nostr:nprofile URIs, for live preview rendering. */
+    val previewContent: StateFlow<String> = combine(_content, _mentions) { content, mentions ->
+        materializeMentions(content.text, mentions).first
+    }.stateIn(viewModelScope, SharingStarted.Eagerly, "")
 
     private val _hashtags = MutableStateFlow<List<String>>(emptyList())
     val hashtags: StateFlow<List<String>> = _hashtags

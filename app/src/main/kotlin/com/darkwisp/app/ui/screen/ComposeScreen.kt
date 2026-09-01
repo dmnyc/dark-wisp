@@ -161,6 +161,7 @@ fun ComposeScreen(
     resolvedEmojis: Map<String, String> = emptyMap()
 ) {
     val content by viewModel.content.collectAsState()
+    val previewContent by viewModel.previewContent.collectAsState()
     val publishing by viewModel.publishing.collectAsState()
     val error by viewModel.error.collectAsState()
     val uploadedUrls by viewModel.uploadedUrls.collectAsState()
@@ -1146,7 +1147,7 @@ fun ComposeScreen(
                                     }
                                 }
                                 RichContent(
-                                    content = content.text,
+                                    content = previewContent,
                                     emojiMap = resolvedEmojis,
                                     eventRepo = eventRepo
                                 )
