@@ -1,11 +1,18 @@
 package com.darkwisp.app.repo
 
 import com.darkwisp.app.db.EventPersistence
+import com.darkwisp.app.nostr.ClientMessage
+import com.darkwisp.app.nostr.Filter
 import com.darkwisp.app.nostr.ProfileData
 import com.darkwisp.app.relay.RelayPool
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 data class MentionCandidate(
     val profile: ProfileData,
@@ -23,7 +30,12 @@ class MentionSearchRepository(
 
     var eventPersistence: EventPersistence? = null
 
+    private var relaySearchJob: Job? = null
+
     fun search(query: String, scope: CoroutineScope) {
+        relaySearchJob?.cancel()
+        relaySearchJob = null
+
         if (query.isBlank()) {
             val contacts = contactRepo.getFollowList().take(5).mapNotNull { entry ->
                 profileRepo.get(entry.pubkey)?.let { MentionCandidate(it, isContact = true) }
@@ -50,28 +62,65 @@ class MentionSearchRepository(
         }
 
         // Fill remaining slots from ObjectBox
+        val seenPubkeys = contactResults.map { it.profile.pubkey }.toMutableSet()
+        var localResults = contactResults
+
         val persistence = eventPersistence
-        if (persistence == null) {
-            _candidates.value = contactResults
-            return
+        if (persistence != null) {
+            val remaining = 5 - contactResults.size
+            val events = persistence.searchProfiles(query, limit = 500)
+            val dbResults = events.mapNotNull { event ->
+                if (!seenPubkeys.add(event.pubkey)) return@mapNotNull null
+                val profile = ProfileData.fromEvent(event) ?: return@mapNotNull null
+                val nameMatch = profile.name?.lowercase()?.contains(lowerQuery) == true
+                val displayMatch = profile.displayName?.lowercase()?.contains(lowerQuery) == true
+                if (!nameMatch && !displayMatch) return@mapNotNull null
+                MentionCandidate(profile, isContact = false)
+            }.take(remaining)
+            localResults = contactResults + dbResults
+            seenPubkeys.addAll(dbResults.map { it.profile.pubkey })
         }
 
-        val seenPubkeys = contactResults.map { it.profile.pubkey }.toMutableSet()
-        val remaining = 5 - contactResults.size
-        val events = persistence.searchProfiles(query, limit = 500)
-        val dbResults = events.mapNotNull { event ->
-            if (!seenPubkeys.add(event.pubkey)) return@mapNotNull null
-            val profile = ProfileData.fromEvent(event) ?: return@mapNotNull null
-            val nameMatch = profile.name?.lowercase()?.contains(lowerQuery) == true
-            val displayMatch = profile.displayName?.lowercase()?.contains(lowerQuery) == true
-            if (!nameMatch && !displayMatch) return@mapNotNull null
-            MentionCandidate(profile, isContact = false)
-        }.take(remaining)
+        _candidates.value = localResults
+        if (localResults.size >= 5) return
 
-        _candidates.value = contactResults + dbResults
+        // Still short of 5 candidates — fall back to a live NIP-50 search query
+        // against a dedicated search relay, streaming matches in as they arrive.
+        val capturedLocal = localResults
+        relaySearchJob = scope.launch(Dispatchers.IO) {
+            val subId = "mention-${System.nanoTime()}"
+            val filter = Filter(kinds = listOf(0), search = query, limit = 10)
+            relayPool.sendToRelayOrEphemeral(SEARCH_RELAY, ClientMessage.req(subId, filter))
+
+            val relayResults = mutableListOf<MentionCandidate>()
+            val eventJob = launch {
+                relayPool.relayEvents.collect { ev ->
+                    if (ev.subscriptionId != subId) return@collect
+                    val profile = ProfileData.fromEvent(ev.event) ?: return@collect
+                    if (seenPubkeys.add(profile.pubkey)) {
+                        relayResults += MentionCandidate(profile, isContact = false)
+                        _candidates.value = capturedLocal + relayResults
+                    }
+                }
+            }
+            try {
+                withTimeoutOrNull(3_000L) {
+                    relayPool.eoseSignals.first { it == subId }
+                }
+            } finally {
+                eventJob.cancel()
+                relayPool.closeOnAllRelays(subId)
+            }
+        }
     }
 
     fun clear() {
+        relaySearchJob?.cancel()
+        relaySearchJob = null
         _candidates.value = emptyList()
+    }
+
+    private companion object {
+        const val SEARCH_RELAY = "wss://search.nostrarchives.com"
     }
 }
