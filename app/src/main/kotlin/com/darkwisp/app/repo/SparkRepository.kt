@@ -377,13 +377,18 @@ class SparkRepository(
         }
     }
 
-    override suspend fun fetchBalance(): Result<Long> = withContext(Dispatchers.IO) {
+    override suspend fun fetchBalance(): Result<Long?> = withContext(Dispatchers.IO) {
         try {
             val instance = sdk ?: return@withContext Result.failure(Exception("Not connected"))
             val info = instance.getInfo(GetInfoRequest(ensureSynced = false))
             val balanceMsats = info.balanceSats.toLong() * 1000
             _identityPubkey.value = info.identityPubkey
-            if (balanceMsats == 0L && !hasSyncedOnce) return@withContext Result.success(0L)
+            // GetInfoResponse carries no flag separating "synced and genuinely
+            // empty" from "not synced yet", so a pre-sync zero can't be
+            // trusted. Report it as unknown rather than as a balance — this is
+            // the value the dashboard renders, and returning 0 here is what
+            // put a confident "0 sats" over funded wallets.
+            if (balanceMsats == 0L && !hasSyncedOnce) return@withContext Result.success(null)
             _balance.value = balanceMsats
             Result.success(balanceMsats)
         } catch (e: Exception) {
