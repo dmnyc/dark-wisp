@@ -43,7 +43,16 @@ interface WalletProvider {
     fun hasConnection(): Boolean
     fun connect()
     fun disconnect()
-    suspend fun fetchBalance(): Result<Long>
+    /**
+     * Current balance in msats, or `null` when it isn't known yet.
+     *
+     * Null is not zero. A wallet that hasn't finished its first sync has no
+     * balance to report, and rendering that as "0 sats" reads as an emptied
+     * wallet rather than one still counting — alarming in exactly the moment
+     * a user is least sure their funds arrived. Callers must show a loading
+     * state for null rather than substituting a figure.
+     */
+    suspend fun fetchBalance(): Result<Long?>
     /**
      * Pay a BOLT11 invoice. A returned [Result.success] means the wallet
      * accepted it — check [WalletPayment.settlement] before telling the user
