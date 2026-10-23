@@ -37,6 +37,7 @@ import com.darkwisp.app.repo.PrivateReplyPublisher
 import com.darkwisp.app.repo.MentionCandidate
 import com.darkwisp.app.repo.MentionSearchRepository
 import com.darkwisp.app.repo.EventRepository
+import com.darkwisp.app.repo.GiphyRepository
 import com.darkwisp.app.repo.InterfacePreferences
 import com.darkwisp.app.repo.ProfileRepository
 import com.darkwisp.app.repo.RelayListRepository
@@ -75,6 +76,7 @@ class ComposeViewModel(app: Application, private val savedStateHandle: SavedStat
     private val keyRepo = KeyRepository(app)
     private val interfacePrefs = InterfacePreferences(app)
     val blossomRepo = BlossomRepository(app, keyRepo.getPubkeyHex())
+    private val giphyRepo by lazy { GiphyRepository(app) }
 
     fun reloadBlossomRepo() {
         blossomRepo.reload(keyRepo.getPubkeyHex())
@@ -282,6 +284,7 @@ class ComposeViewModel(app: Application, private val savedStateHandle: SavedStat
     private var countdownJob: Job? = null
     private var pendingPublish: (() -> Unit)? = null
     private var mentionSearchRepo: MentionSearchRepository? = null
+    private var profileRepo: ProfileRepository? = null
     private var eventRepo: EventRepository? = null
     private var dmRepo: DmRepository? = null
     private var relayListRepo: RelayListRepository? = null
@@ -301,6 +304,7 @@ class ComposeViewModel(app: Application, private val savedStateHandle: SavedStat
     ) {
         if (initialized) return
         initialized = true
+        this.profileRepo = profileRepo
         this.eventRepo = eventRepo
         this.dmRepo = dmRepo
         this.relayListRepo = relayListRepo
@@ -343,37 +347,74 @@ class ComposeViewModel(app: Application, private val savedStateHandle: SavedStat
                 try {
                     _uploadProgress.value = if (total > 1) "Uploading ${index + 1}/$total..." else "Uploading..."
                     val (rawBytes, rawMime, rawExt) = readFileFromUri(contentResolver, uri)
-                    val (bytes, mime, ext) = when {
-                        rawMime == "image/gif" -> GifToMp4Converter.convert(rawBytes, getApplication())
-                        rawMime.startsWith("image/") -> MediaCompressor.compressForContent(rawBytes, rawMime).asTriple()
-                        else -> Triple(rawBytes, rawMime, rawExt)
-                    }
-                    // Re-extract dimensions from post-pipeline bytes so dim tags match what's uploaded.
-                    val dims = extractDimensionsFromBytes(bytes, mime)
-                    val thumbhash = if (mime.startsWith("image/")) createThumbhash(bytes) else null
-                    val url = blossomRepo.uploadMedia(bytes, mime, ext, signer)
-                    _uploadedUrls.value = _uploadedUrls.value + url
-                    _uploadedMediaMeta[url] = UploadedMediaMeta(
-                        mimeType = mime,
-                        dimensions = dims,
-                        thumbhash = thumbhash
-                    )
-                    if (_galleryMode.value && mime.startsWith("video/")) {
-                        _galleryHasVideo.value = true
-                    }
-                    // In gallery mode, don't insert URLs into the text — they're shown in the pager
-                    if (!_galleryMode.value) {
-                        val current = _content.value.text
-                        val newText = if (current.isBlank()) url else "$current\n$url"
-                        _content.value = TextFieldValue(newText, TextRange(newText.length))
-                        savedStateHandle["draft_content"] = newText
-                    }
+                    if (!processUpload(rawBytes, rawMime, rawExt, signer)) break
                 } catch (e: Exception) {
                     _error.value = "Upload failed: ${e.message}"
                     break
                 }
             }
             _uploadProgress.value = null
+        }
+    }
+
+    /** Picks a GIF or sticker from the Giphy picker: download the bytes from
+     *  Giphy's CDN and run the standard attachment pipeline, so a picked GIF
+     *  transcodes to MP4 exactly like a GIF chosen from the system picker. */
+    fun uploadGifFromUrl(url: String, signer: NostrSigner? = null) {
+        viewModelScope.launch {
+            _uploadProgress.value = "Uploading..."
+            try {
+                val (bytes, mime) = giphyRepo.download(url)
+                processUpload(bytes, mime, "gif", signer)
+            } catch (e: Exception) {
+                _error.value = "GIF download failed: ${e.message}"
+            } finally {
+                _uploadProgress.value = null
+            }
+        }
+    }
+
+    /** Shared attachment pipeline: GIFs transcode to MP4, other images
+     *  compress, dimensions + thumbhash are captured for imeta, the bytes go
+     *  to Blossom, and the URL attaches to this compose (into the body in
+     *  note mode; pager-only in gallery mode). Returns false when the upload
+     *  failed (error message already set). */
+    private suspend fun processUpload(
+        rawBytes: ByteArray,
+        rawMime: String,
+        rawExt: String,
+        signer: NostrSigner?
+    ): Boolean {
+        return try {
+            val (bytes, mime, ext) = when {
+                rawMime == "image/gif" -> GifToMp4Converter.convert(rawBytes, getApplication())
+                rawMime.startsWith("image/") -> MediaCompressor.compressForContent(rawBytes, rawMime).asTriple()
+                else -> Triple(rawBytes, rawMime, rawExt)
+            }
+            // Re-extract dimensions from post-pipeline bytes so dim tags match what's uploaded.
+            val dims = extractDimensionsFromBytes(bytes, mime)
+            val thumbhash = if (mime.startsWith("image/")) createThumbhash(bytes) else null
+            val url = blossomRepo.uploadMedia(bytes, mime, ext, signer)
+            _uploadedUrls.value = _uploadedUrls.value + url
+            _uploadedMediaMeta[url] = UploadedMediaMeta(
+                mimeType = mime,
+                dimensions = dims,
+                thumbhash = thumbhash
+            )
+            if (_galleryMode.value && mime.startsWith("video/")) {
+                _galleryHasVideo.value = true
+            }
+            // In gallery mode, don't insert URLs into the text — they're shown in the pager
+            if (!_galleryMode.value) {
+                val current = _content.value.text
+                val newText = if (current.isBlank()) url else "$current\n$url"
+                _content.value = TextFieldValue(newText, TextRange(newText.length))
+                savedStateHandle["draft_content"] = newText
+            }
+            true
+        } catch (e: Exception) {
+            _error.value = "Upload failed: ${e.message}"
+            false
         }
     }
 
@@ -529,13 +570,58 @@ class ComposeViewModel(app: Application, private val savedStateHandle: SavedStat
         clearMentionState()
     }
 
-    private fun sanitizeMentionDisplay(candidate: MentionCandidate): String {
-        val raw = candidate.profile.displayName?.takeIf { it.isNotBlank() }
-            ?: candidate.profile.name?.takeIf { it.isNotBlank() }
-            ?: return candidate.profile.pubkey.take(8) + "…" + candidate.profile.pubkey.takeLast(4)
-        // Strip whitespace and leading @ so the mention remains a single token and mention detection
-        // can't re-trigger on a name that itself contains spaces.
+    private fun sanitizeMentionDisplay(candidate: MentionCandidate): String =
+        sanitizeMentionToken(
+            candidate.profile.displayName?.takeIf { it.isNotBlank() }
+                ?: candidate.profile.name?.takeIf { it.isNotBlank() },
+            candidate.profile.pubkey
+        )
+
+    /** Single-token mention display: strips whitespace and the leading @ so
+     *  the mention remains one token and mention detection can't re-trigger
+     *  on a name that itself contains spaces; a blank name falls back to a
+     *  short pubkey. */
+    private fun sanitizeMentionToken(rawDisplayName: String?, pubkey: String): String {
+        val raw = rawDisplayName?.takeIf { it.isNotBlank() }
+            ?: return pubkey.take(8) + "…" + pubkey.takeLast(4)
         return raw.trim().removePrefix("@").replace(Regex("\\s+"), "_")
+    }
+
+    /** Converts every `nostr:nprofile1…` / `nostr:npub1…` URI in [text] back
+     *  to a sanitized `@displayName` token plus a tracked mention range — a
+     *  pure display rehydrate; `materializeMentions` turns them into URIs
+     *  again at publish. Unresolvable profiles fall back to a short pubkey;
+     *  undecodable URIs pass through untouched. */
+    private fun rehydrateMentionsFromContent(text: String): Pair<String, List<Mention>> {
+        val regex = Regex("nostr:(nprofile1[a-z0-9]+|npub1[a-z0-9]{58})")
+        val matches = regex.findAll(text).toList()
+        if (matches.isEmpty()) return text to emptyList()
+
+        val mentions = mutableListOf<Mention>()
+        val sb = StringBuilder(text.length)
+        var last = 0
+        for (match in matches) {
+            val end = match.range.last + 1
+            val pubkey = try {
+                when (val data = Nip19.decodeNostrUri("nostr:" + match.groupValues[1])) {
+                    is com.darkwisp.app.nostr.NostrUriData.ProfileRef -> data.pubkey
+                    else -> null
+                }
+            } catch (_: Exception) { null }
+            if (pubkey == null) {
+                sb.append(text, last, end)
+                last = end
+                continue
+            }
+            val display = "@" + sanitizeMentionToken(profileRepo?.get(pubkey)?.displayString, pubkey)
+            sb.append(text, last, match.range.first)
+            val start = sb.length
+            sb.append(display)
+            mentions.add(Mention(start, sb.length, pubkey))
+            last = end
+        }
+        sb.append(text, last, text.length)
+        return sb.toString() to mentions
     }
 
 
@@ -1143,9 +1229,15 @@ class ComposeViewModel(app: Application, private val savedStateHandle: SavedStat
 
     fun loadDraft(draft: Nip37.Draft) {
         currentDraftId = draft.dTag
-        val text = draft.content
+        // Drafts persist mentions as nostr:nprofile/npub URIs (saveDraft
+        // materializes them) — convert them back to @name pills so the editor
+        // renders like the session the draft was saved from.
+        val (text, restoredMentions) = rehydrateMentionsFromContent(draft.content)
         _content.value = TextFieldValue(text, TextRange(text.length))
+        _mentions.value = restoredMentions
         savedStateHandle["draft_content"] = text
+        saveMentionsToState()
+        detectHashtags(text)
         // Re-apply descriptions saved with the draft (imeta inner tags keyed
         // by URL). Entries for URLs the user re-attaches resurface on the
         // chips; undescribed uploads are unaffected.
