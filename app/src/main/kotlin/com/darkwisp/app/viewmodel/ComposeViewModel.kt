@@ -19,6 +19,7 @@ import com.darkwisp.app.nostr.Nip10
 import com.darkwisp.app.nostr.Nip30
 import com.darkwisp.app.nostr.Nip18
 import com.darkwisp.app.nostr.Nip19
+import com.darkwisp.app.nostr.Nip22
 import com.darkwisp.app.nostr.Nip37
 import com.darkwisp.app.nostr.Nip68
 import com.darkwisp.app.nostr.Nip71
@@ -781,7 +782,13 @@ class ComposeViewModel(app: Application, private val savedStateHandle: SavedStat
         }
         if (replyTo != null) {
             val hint = outboxRouter?.getRelayHint(replyTo.pubkey) ?: ""
-            tags.addAll(Nip10.buildReplyTags(replyTo, hint))
+            if (replyTo.kind == Nip22.KIND_COMMENT) {
+                // Replying to a NIP-22 comment: publish a comment, with the root
+                // in the uppercase E scope and the parent in lowercase e.
+                tags.addAll(Nip22.buildCommentTags(replyTo, hint))
+            } else {
+                tags.addAll(Nip10.buildReplyTags(replyTo, hint))
+            }
         }
 
         val (mentionedPubkeys, _) = extractNostrRefs(content)
@@ -885,7 +892,9 @@ class ComposeViewModel(app: Application, private val savedStateHandle: SavedStat
                 eventKind = Nip88.KIND_POLL
             }
         } else {
-            eventKind = 1
+            // Mirror the target's namespace: reply to a comment with a comment,
+            // everything else with a kind 1 note.
+            eventKind = if (replyTo?.kind == Nip22.KIND_COMMENT) Nip22.KIND_COMMENT else 1
         }
 
         if (!_galleryMode.value) {
@@ -1277,7 +1286,11 @@ class ComposeViewModel(app: Application, private val savedStateHandle: SavedStat
             try {
                 val innerTags = mutableListOf<List<String>>()
                 if (replyTo != null) {
-                    innerTags.addAll(Nip10.buildReplyTags(replyTo))
+                    if (replyTo.kind == Nip22.KIND_COMMENT) {
+                        innerTags.addAll(Nip22.buildCommentTags(replyTo))
+                    } else {
+                        innerTags.addAll(Nip10.buildReplyTags(replyTo))
+                    }
                 }
                 // Alt text rides in the draft as imeta inner tags keyed by URL
                 // so a restored draft can re-apply the descriptions. Only
@@ -1288,14 +1301,15 @@ class ComposeViewModel(app: Application, private val savedStateHandle: SavedStat
                         innerTags.add(listOf("imeta", "url $draftAltUrl", "alt $normalizedAlt"))
                     }
                 }
+                val innerKind = if (replyTo?.kind == Nip22.KIND_COMMENT) Nip22.KIND_COMMENT else 1
                 val innerJson = Nip37.serializeDraftContent(
                     pubkeyHex = signer.pubkeyHex,
-                    innerKind = 1,
+                    innerKind = innerKind,
                     content = text,
                     tags = innerTags
                 )
                 val encrypted = signer.nip44Encrypt(innerJson, signer.pubkeyHex)
-                val wrapperTags = Nip37.buildDraftTags(draftId, 1)
+                val wrapperTags = Nip37.buildDraftTags(draftId, innerKind)
                 val event = signer.signEvent(
                     kind = Nip37.KIND_DRAFT,
                     content = encrypted,
