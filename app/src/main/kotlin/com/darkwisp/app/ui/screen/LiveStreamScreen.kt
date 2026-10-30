@@ -140,9 +140,11 @@ fun LiveStreamScreen(
     // while users park on the watch-party chat, and idle behavior resumes
     // on leaving the screen.
     val context = LocalContext.current
+    // Held for the whole screen via the shared holder registry, so the
+    // embedded inline player pausing cannot clear keep-awake mid-stream.
     DisposableEffect(context) {
-        context.updateKeepScreenOn(true)
-        onDispose { context.updateKeepScreenOn(false) }
+        context.updateKeepScreenOn("livestream-screen", true)
+        onDispose { context.updateKeepScreenOn("livestream-screen", false) }
     }
 
     Column(modifier = Modifier.fillMaxSize()) {
